@@ -1,0 +1,22 @@
+{
+  "codex_homes": [
+    "~/.codex"
+  ],
+  "agy_roots": [
+    {
+      "label": "default",
+      "path": "~/.gemini/antigravity-cli"
+    }
+  ],
+  "projects": {
+    "my-webapp": ["my-webapp", "webapp-frontend", "webapp-backend"],
+    "infra": ["terraform", "ansible", "k8s"]
+  },
+  "bypass_rules": [
+    {
+      "name": "Direct psql instead of safe DB wrapper",
+      "pattern": "\\bpsql\\b|asyncpg\\.connect|psycopg2",
+      "unless": "db-safe-query"
+    }
+  ]
+}
