@@ -34,7 +34,8 @@ agent-audit --days 7 --output /tmp/agent-audit-latest.md
 
 1. **Token Usage & Prompt Cache Efficiency** (by agent and by project):
    - Active sessions and model steps;
-   - Total input tokens, cache hit rate (`%`), **uncached input tokens** (actual quota/cost driver), and output tokens (including reasoning tokens).
+   - Total input tokens, cache hit rate (`%`), **uncached input tokens** (actual quota/cost driver), and output tokens (including reasoning tokens);
+   - **Phase Breakdown (Exploration vs Implementation KPI):** splits steps and uncached input into 3 phases—exploration before 1st edit, implementation & verification from 1st edit onward, and pure research/Q&A sessions without edits—reporting `% Before 1st Edit` (of all sessions and within edit sessions) and average uncached input per edit session.
 2. **Cross-Session Repeated Lookups (Automation Candidates):**
    - Which `.env` and credential files agents manually inspected across multiple sessions, and which variable names (`DATABASE_URL`, `OPENAI_API_KEY`, `SENTRY_DSN`, etc.) they grepped for;
    - Which application files (excluding `AGENTS.md`/`SKILL.md`/rules) are read across the highest number of sessions;
@@ -42,8 +43,10 @@ agent-audit --days 7 --output /tmp/agent-audit-latest.md
 3. **Tool Failures, Polling Loops & Workflow Bypasses:**
    - Custom tool-bypass checks (configured in `~/.config/agent-audit/config.json`);
    - MCP tool call counts, failure rates (`%`), and top failure reasons;
+   - **Codegraph Adoption in Antigravity (`agy`):** total `codegraph` calls and session share vs manual `read_file`/`view_file` and `rg`/`grep` navigation, plus per-tool breakdown;
    - Top failing shell commands and consecutive polling loops (`≥3` identical commands in a row within a single session, e.g. manual `gh pr checks` polling).
 4. **Context Bloat X-Ray (4-Lens Breakdown):**
+   - *Note:* Metrics in Sections 2–4 (file reads, subagents, cache busts) are overlapping slices of total token spend and should not be summed mechanically.
    - **Command outputs `>30 KB`** and context compaction counts (`contextCompaction` in Codex, `CHECKPOINT` in Antigravity);
    - **File read discipline** in Antigravity (`StartLine`/`EndLine` bounded reads vs full unbounded file reads) and `truncated_fields` counts;
    - **4.1 Intra-session file re-reads** (`≥4x` reads of the same file within a single session);

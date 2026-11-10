@@ -32,13 +32,25 @@ RULE_DOC_PATTERNS = (
     "SKILL.md",
     "/docs/learned/",
     "/docs/agent-rules/",
+    "/docs/server-map.md",
     "/.agent/rules/",
     "/.agents/skills/",
     "/.claude/rules/",
     "/.claude/skills/",
     "/.codex/memories/",
     "/.codex/skills/",
+    "UI_LAW.md",
+    "SOFT_UI.md",
 )
+
+EDIT_TOOL_KEYWORDS = {
+    "edit_file",
+    "write_file",
+    "replace_file_content",
+    "apply_patch",
+    "filechange",
+    "write_to_file",
+}
 
 GENERIC_PATH_PARTS = {
     "",
@@ -162,8 +174,9 @@ def classify_project(text: str, custom_rules: dict[str, list[str]] | None = None
             if any(k.lower() in s_low for k in keywords):
                 return proj_name
 
-    # Extract paths from text and infer project name from directory structure
-    paths = re.findall(r"(/[A-Za-z0-9_./-]+)", s)
+    # Extract filesystem paths (ignoring XML closing tags like </USER_REQUEST> and URLs like https://...)
+    cleaned_s = re.sub(r"https?://[^\s\"')>]+", " ", s)
+    paths = re.findall(r"(?<![</A-Za-z0-9_:])(/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)", cleaned_s)
     home_str = str(Path.home())
 
     for raw_p in paths:
@@ -366,6 +379,32 @@ def collect_codex(
     cache_busts: list[dict[str, Any]] = []
     cache_bust_tokens_by_session: Counter = Counter()
 
+    # Exploration vs Implementation phases
+    first_edit_ms_by_tid: dict[str, int] = {}
+    for home in codex_homes:
+        db = home / "thread_history_1.sqlite"
+        if not db.exists():
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            for row in conn.execute(
+                """
+                SELECT thread_id, MIN(created_at_ms)
+                FROM thread_items
+                WHERE item_type IN ('fileChange', 'edit_file', 'write_file', 'replace_file_content', 'apply_patch')
+                   OR (item_type = 'mcpToolCall' AND (
+                       item_json LIKE '%edit_file%' OR item_json LIKE '%write_file%' OR item_json LIKE '%apply_patch%' OR item_json LIKE '%replace_file_content%'
+                   ))
+                GROUP BY thread_id
+                """
+            ):
+                first_edit_ms_by_tid[row[0]] = row[1]
+        except Exception:
+            pass
+
+    session_step_records: dict[str, list[tuple[int, bool]]] = defaultdict(list)
+    session_has_edit: dict[str, bool] = defaultdict(bool)
+
     start_ts = start_dt.timestamp()
     for home in codex_homes:
         sess_dir = home / "sessions"
@@ -397,6 +436,7 @@ def collect_codex(
             prev_total: dict[str, int] = {}
             prev_step_input_by_sid: dict[str, int] = {}
             last_action_by_sid: dict[str, str] = {}
+            edit_seen_in_file = False
 
             try:
                 with path.open("r", encoding="utf-8", errors="ignore") as f:
@@ -425,10 +465,18 @@ def collect_codex(
                             if p.get("cwd") and sid:
                                 cwd = p["cwd"]
                                 session_cwds[sid] = cwd
+                        elif typ == "event_msg" and p.get("type") == "item_completed":
+                            item = p.get("item") or {}
+                            ityp = str(item.get("type") or "").lower()
+                            iname = str(item.get("name") or item.get("tool") or "").lower()
+                            if ityp in EDIT_TOOL_KEYWORDS or iname in EDIT_TOOL_KEYWORDS:
+                                edit_seen_in_file = True
                         elif typ == "response_item" and sid:
                             ptype = p.get("type")
                             if ptype in ("function_call", "custom_tool_call"):
                                 name = p.get("name") or "tool"
+                                if str(name).lower() in EDIT_TOOL_KEYWORDS:
+                                    edit_seen_in_file = True
                                 args_raw = str(p.get("arguments") or p.get("input") or "")
                                 if name == "exec_command":
                                     try:
@@ -512,6 +560,13 @@ def collect_codex(
                             by_session_tokens[t_sid].update(delta)
                             session_models[t_sid] = meta.get("model") or model
                             session_dates[t_sid] = ts_str[:10]
+
+                            cur_ms = int(dt.timestamp() * 1000) if dt else 0
+                            fed_ms = first_edit_ms_by_tid.get(t_sid)
+                            is_after = edit_seen_in_file or (fed_ms is not None and cur_ms >= fed_ms)
+                            session_step_records[t_sid].append((unc, is_after))
+                            if edit_seen_in_file or fed_ms is not None:
+                                session_has_edit[t_sid] = True
                         elif not has_usage_records and typ == "event_msg" and p.get("type") == "token_count":
                             tot = (p.get("info") or {}).get("total_token_usage")
                             if not isinstance(tot, dict) or tot == prev_total:
@@ -534,6 +589,14 @@ def collect_codex(
                             by_session_tokens[t_sid].update(d_vals)
                             session_models[t_sid] = meta.get("model") or model
                             session_dates[t_sid] = ts_str[:10]
+
+                            cur_ms = int(dt.timestamp() * 1000) if dt else 0
+                            fed_ms = first_edit_ms_by_tid.get(t_sid)
+                            is_after = edit_seen_in_file or (fed_ms is not None and cur_ms >= fed_ms)
+                            unc_d = max(0, d_vals.get("input_tokens", 0) - d_vals.get("cached_input_tokens", 0))
+                            session_step_records[t_sid].append((unc_d, is_after))
+                            if edit_seen_in_file or fed_ms is not None:
+                                session_has_edit[t_sid] = True
             except Exception:
                 continue
 
@@ -658,6 +721,25 @@ def collect_codex(
                     else:
                         mcp_fail_reasons[key][err_txt[:80].replace("\n", " ")] += 1
 
+    codex_phase_tokens: Counter = Counter()
+    codex_phase_steps: Counter = Counter()
+    edit_sessions = {s for s, h in session_has_edit.items() if h and s in by_session_tokens}
+    for s_id, steps in session_step_records.items():
+        if s_id not in by_session_tokens:
+            continue
+        if s_id in edit_sessions:
+            for unc_val, is_after in steps:
+                if not is_after:
+                    codex_phase_tokens["a"] += unc_val
+                    codex_phase_steps["a"] += 1
+                else:
+                    codex_phase_tokens["b"] += unc_val
+                    codex_phase_steps["b"] += 1
+        else:
+            for unc_val, _ in steps:
+                codex_phase_tokens["c"] += unc_val
+                codex_phase_steps["c"] += 1
+
     return {
         "threads_meta": threads_meta,
         "subagent_parent": subagent_parent,
@@ -688,6 +770,9 @@ def collect_codex(
         "token_spikes": token_spikes,
         "cache_busts": cache_busts,
         "cache_bust_tokens_by_session": cache_bust_tokens_by_session,
+        "phase_tokens": codex_phase_tokens,
+        "phase_steps": codex_phase_steps,
+        "edit_sessions_count": len(edit_sessions),
     }
 
 
@@ -727,6 +812,13 @@ def collect_antigravity(
     token_spikes: list[dict[str, Any]] = []
     cache_busts: list[dict[str, Any]] = []
     cache_bust_tokens_by_session: Counter = Counter()
+
+    # Exploration vs implementation phases & codegraph adoption
+    codegraph_counts: Counter = Counter()
+    codegraph_sessions: dict[str, set[str]] = defaultdict(set)
+    rg_grep_cmd_calls = 0
+    rg_grep_sessions: set[str] = set()
+    session_phase_data: dict[str, tuple[list[tuple[int, bool]], bool, int | None]] = {}
 
     start_ts = start_dt.timestamp()
 
@@ -780,6 +872,9 @@ def collect_antigravity(
 
         prev_inp = 0
         last_action = "(start/reply)"
+        session_steps: list[tuple[int, bool]] = []
+        has_edit = False
+        first_edit_idx: int | None = None
 
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as f:
@@ -858,8 +953,30 @@ def collect_antigravity(
 
                         last_tools_in_session = []
                         step_actions: list[str] = []
+                        is_edit_step = False
                         for tc in ev.get("tool_calls") or []:
                             tname = tc.get("name") or tc.get("tool_name") or "unknown"
+                            tname_lower = str(tname).lower().strip()
+                            if tname_lower in EDIT_TOOL_KEYWORDS:
+                                is_edit_step = True
+                                has_edit = True
+                            if tname.startswith("mcp_codegraph_") or tname in (
+                                "find_symbol", "callers_of", "find_routes", "route_usage", "component_usage", "plan_change", "semantic_search"
+                            ):
+                                codegraph_counts[tname] += 1
+                                codegraph_sessions[tname].add(sid)
+                            elif tname == "call_mcp_tool":
+                                a_mcp = tc.get("arguments") or tc.get("args") or {}
+                                if isinstance(a_mcp, str):
+                                    try:
+                                        a_mcp = json.loads(a_mcp)
+                                    except Exception:
+                                        a_mcp = {}
+                                if isinstance(a_mcp, dict) and (a_mcp.get("ServerName") == "codegraph" or "codegraph" in str(a_mcp.get("ToolName", ""))):
+                                    tl = str(a_mcp.get("ToolName") or "codegraph")
+                                    codegraph_counts[f"codegraph.{tl}"] += 1
+                                    codegraph_sessions[f"codegraph.{tl}"].add(sid)
+
                             tool_counts[tname] += 1
                             last_tools_in_session.append(tname)
                             args = tc.get("arguments") or tc.get("args") or {}
@@ -899,13 +1016,40 @@ def collect_antigravity(
                                 cmd_sessions[sig].add(sid)
                                 for rg_pat in extract_rg_patterns(cmd_line):
                                     rg_pattern_sessions[rg_pat].add(sid)
+                                if "rg " in cmd_line or "grep " in cmd_line:
+                                    rg_grep_cmd_calls += 1
+                                    rg_grep_sessions.add(sid)
                                 c_low = cmd_line.lower()
                                 for b_name in check_bypasses(c_low, custom_bypasses):
                                     bypass_counts[b_name].add(sid)
                         if step_actions:
                             last_action = ", ".join(step_actions[:2])
+                        session_steps.append((unc_in, is_edit_step))
+                        if is_edit_step and first_edit_idx is None:
+                            first_edit_idx = len(session_steps) - 1
+            if session_steps:
+                session_phase_data[sid] = (session_steps, has_edit, first_edit_idx)
         except Exception:
             continue
+
+    agy_phase_tokens: Counter = Counter()
+    agy_phase_steps: Counter = Counter()
+    edit_sessions_a = {s for s, (steps, has_edit, _) in session_phase_data.items() if has_edit and s in by_session_tokens}
+    for s_id, (steps, has_edit, first_idx) in session_phase_data.items():
+        if s_id not in by_session_tokens:
+            continue
+        if has_edit and first_idx is not None:
+            for idx, (unc_val, _) in enumerate(steps):
+                if idx < first_idx:
+                    agy_phase_tokens["a"] += unc_val
+                    agy_phase_steps["a"] += 1
+                else:
+                    agy_phase_tokens["b"] += unc_val
+                    agy_phase_steps["b"] += 1
+        else:
+            for unc_val, _ in steps:
+                agy_phase_tokens["c"] += unc_val
+                agy_phase_steps["c"] += 1
 
     return {
         "token_totals": token_totals,
@@ -933,6 +1077,13 @@ def collect_antigravity(
         "token_spikes": token_spikes,
         "cache_busts": cache_busts,
         "cache_bust_tokens_by_session": cache_bust_tokens_by_session,
+        "phase_tokens": agy_phase_tokens,
+        "phase_steps": agy_phase_steps,
+        "edit_sessions_count": len(edit_sessions_a),
+        "codegraph_counts": codegraph_counts,
+        "codegraph_sessions": codegraph_sessions,
+        "rg_grep_cmd_calls": rg_grep_cmd_calls,
+        "rg_grep_sessions": rg_grep_sessions,
     }
 
 
@@ -953,11 +1104,18 @@ def cache_pct(inp: int, cached: int) -> str:
 def build_json_summary(days: int, start_dt: datetime, codex: dict[str, Any], agy: dict[str, Any]) -> dict[str, Any]:
     c_tok = codex["token_totals"]
     a_tok = agy["token_totals"]
+    c_pt = codex.get("phase_tokens", Counter())
+    c_ps = codex.get("phase_steps", Counter())
+    a_pt = agy.get("phase_tokens", Counter())
+    a_ps = agy.get("phase_steps", Counter())
+    cg_counts = agy.get("codegraph_counts", Counter())
+    cg_sessions = agy.get("codegraph_sessions", defaultdict(set))
     return {
         "window_days": days,
         "start_utc": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "codex": {
             "active_sessions": len(codex["by_session_tokens"]),
+            "edit_sessions": codex.get("edit_sessions_count", 0),
             "steps": c_tok["steps"],
             "input_tokens": c_tok["input_tokens"],
             "cached_input_tokens": c_tok["cached_input_tokens"],
@@ -967,9 +1125,20 @@ def build_json_summary(days: int, start_dt: datetime, codex: dict[str, Any], agy
             "compactions": sum(codex["compactions_by_session"].values()),
             "token_spikes": len(codex["token_spikes"]),
             "cache_busts": len(codex["cache_busts"]),
+            "phase_uncached_tokens": {
+                "exploration_before_first_edit": c_pt["a"],
+                "implementation_and_verification": c_pt["b"],
+                "pure_research": c_pt["c"],
+            },
+            "phase_steps": {
+                "exploration_before_first_edit": c_ps["a"],
+                "implementation_and_verification": c_ps["b"],
+                "pure_research": c_ps["c"],
+            },
         },
         "antigravity": {
             "active_sessions": len(agy["by_session_tokens"]),
+            "edit_sessions": agy.get("edit_sessions_count", 0),
             "steps": a_tok["steps"],
             "input_tokens": a_tok["input_tokens"],
             "cached_input_tokens": a_tok["cached_input_tokens"],
@@ -980,6 +1149,18 @@ def build_json_summary(days: int, start_dt: datetime, codex: dict[str, Any], agy
             "cache_busts": len(agy["cache_busts"]),
             "read_bounded": agy["read_bounded_counts"]["bounded"],
             "read_full": agy["read_bounded_counts"]["full"],
+            "codegraph_calls": sum(cg_counts.values()),
+            "codegraph_sessions": len(set().union(*cg_sessions.values())) if cg_sessions else 0,
+            "phase_uncached_tokens": {
+                "exploration_before_first_edit": a_pt["a"],
+                "implementation_and_verification": a_pt["b"],
+                "pure_research": a_pt["c"],
+            },
+            "phase_steps": {
+                "exploration_before_first_edit": a_ps["a"],
+                "implementation_and_verification": a_ps["b"],
+                "pure_research": a_ps["c"],
+            },
         },
     }
 
@@ -1045,6 +1226,51 @@ def render_markdown(
         for _, p, stp, inp, unc, out, cac in sorted(proj_rows, reverse=True):
             lines.append(f"| `{p}` | {stp} | {fmt_m(inp)} | **{fmt_m(unc)}** | {fmt_m(out)} | {cache_pct(inp, cac)} |")
         lines.append("")
+
+    lines.append(
+        "### Фазовый разрез: разведка vs реализация (Exploration vs Implementation KPI)"
+        if ru else "### Phase Breakdown: Exploration vs Implementation KPI"
+    )
+    lines.append("")
+    if ru:
+        lines.append(
+            "| Агент | Активных сессий (с правками) | Разведка до 1-й правки | Реализация и проверка | Чисто исслед. сессии | "
+            "% до 1-й правки (от всех) | % до 1-й правки (в сессиях с правками) | Ср. некэш./сессию с правками |"
+        )
+    else:
+        lines.append(
+            "| Agent | Active Sessions (with edits) | Exploration (before 1st edit) | Implementation & Verification | Pure Research Sessions | "
+            "% Before 1st Edit (of all) | % Before 1st Edit (in edit sessions) | Avg Uncached / Edit Session |"
+        )
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+
+    step_lbl = "шаг." if ru else "steps"
+    for ag_label, data, total_unc in (("Codex", codex, c_uncached), ("Antigravity (`agy`)", agy, a_uncached)):
+        pt = data.get("phase_tokens", Counter())
+        ps = data.get("phase_steps", Counter())
+        total_s = len(data["by_session_tokens"])
+        edit_s = data.get("edit_sessions_count", 0)
+
+        unc_a = pt["a"]
+        unc_b = pt["b"]
+        unc_c = pt["c"]
+        steps_a = ps["a"]
+        steps_b = ps["b"]
+        steps_c = ps["c"]
+
+        edit_unc = unc_a + unc_b
+        pct_all = f"{(unc_a / total_unc) * 100:.1f}%" if total_unc > 0 else "0.0%"
+        pct_edit = f"{(unc_a / edit_unc) * 100:.1f}%" if edit_unc > 0 else "0.0%"
+        avg_edit = fmt_m(int(edit_unc / edit_s)) if edit_s > 0 else "0"
+
+        lines.append(
+            f"| **{ag_label}** | {total_s} (**{edit_s}**) | "
+            f"**{fmt_m(unc_a)}** ({fmt_m(steps_a)} {step_lbl}) | "
+            f"{fmt_m(unc_b)} ({fmt_m(steps_b)} {step_lbl}) | "
+            f"{fmt_m(unc_c)} ({fmt_m(steps_c)} {step_lbl}) | "
+            f"**{pct_all}** | **{pct_edit}** | **{avg_edit}** |"
+        )
+    lines.append("")
 
     lines.append(
         "## 2. Повторяющиеся раскопки между сессиями (кандидаты на автоматизацию)"
@@ -1145,6 +1371,49 @@ def render_markdown(
             lines.append(f"| `{tool}` | {cnt} | {fails} | {rate} | {top_reason} |")
         lines.append("")
 
+    lines.append(
+        "### Использование codegraph в Antigravity (`agy`)"
+        if ru else "### Codegraph Adoption in Antigravity (`agy`)"
+    )
+    cg_counts = agy.get("codegraph_counts", Counter())
+    cg_sessions = agy.get("codegraph_sessions", defaultdict(set))
+    cg_total_calls = sum(cg_counts.values())
+    cg_total_sessions = len(set().union(*cg_sessions.values())) if cg_sessions else 0
+    read_calls = agy["tool_counts"].get("read_file", 0) + agy["tool_counts"].get("view_file", 0)
+    rg_calls = agy.get("rg_grep_cmd_calls", 0) + agy["tool_counts"].get("grep_search", 0)
+    rg_sess = len(agy.get("rg_grep_sessions", set()))
+
+    if ru:
+        lines.append(
+            f"- **Вызовы codegraph:** всего **{cg_total_calls} вызовов** в **{cg_total_sessions} сессиях** "
+            f"({cache_pct(len(agy['by_session_tokens']), cg_total_sessions)} активных сессий agy)."
+        )
+        lines.append(
+            f"- **Сравнение с ручной навигацией:** `read_file`/`view_file` — **{read_calls} вызовов**, "
+            f"`grep_search` + `rg`/`grep` в командах — **{rg_calls} вызовов** (в {rg_sess} сессиях)."
+        )
+    else:
+        lines.append(
+            f"- **Codegraph calls:** **{cg_total_calls} total calls** across **{cg_total_sessions} sessions** "
+            f"({cache_pct(len(agy['by_session_tokens']), cg_total_sessions)} of active agy sessions)."
+        )
+        lines.append(
+            f"- **Comparison vs manual navigation:** `read_file`/`view_file` — **{read_calls} calls**, "
+            f"`grep_search` + shell `rg`/`grep` — **{rg_calls} calls** (across {rg_sess} sessions)."
+        )
+    if cg_counts:
+        lines.append("")
+        if ru:
+            lines.append("| Инструмент codegraph | Вызовов | Сессий | Доля вызовов |")
+        else:
+            lines.append("| Codegraph Tool | Calls | Sessions | Share of Calls |")
+        lines.append("|---|---:|---:|---:|")
+        for tool, cnt in sorted(cg_counts.items(), key=lambda x: x[1], reverse=True):
+            s_cnt = len(cg_sessions.get(tool, set()))
+            share = f"{(cnt / cg_total_calls) * 100:.1f}%" if cg_total_calls else "0%"
+            lines.append(f"| `{tool}` | {cnt} | {s_cnt} | {share} |")
+    lines.append("")
+
     if codex["cmd_fails"]:
         lines.append("### Топ падающих shell-команд (Codex)" if ru else "### Top Failing Shell Commands (Codex)")
         for sig, f_cnt in codex["cmd_fails"].most_common(10):
@@ -1170,6 +1439,17 @@ def render_markdown(
         "## 4. Рентген раздувания контекста (где сессии набирают лишний вес)"
         if ru else "## 4. Context Bloat X-Ray (4-Lens Breakdown)"
     )
+    lines.append("")
+    if ru:
+        lines.append(
+            "> [!NOTE] Метрики разделов 2–4 (чтение файлов, субагенты, сбросы кэша) — это пересекающиеся срезы общего расхода "
+            "(субагент тоже читает файлы и ловит cache bust), поэтому их нельзя механически складывать."
+        )
+    else:
+        lines.append(
+            "> [!NOTE] Metrics in Sections 2–4 (file reads, subagents, cache busts) are overlapping slices of total token spend "
+            "(e.g., a subagent also reads files and can trigger a cache bust) and should not be summed mechanically."
+        )
     lines.append("")
     total_c_comp = sum(codex["compactions_by_session"].values())
     total_a_comp = sum(agy["compactions_by_session"].values())

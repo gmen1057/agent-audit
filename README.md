@@ -89,6 +89,13 @@ agent-audit --days 7 --output /tmp/agent-audit-latest.md
 | `billing-api` | 980 | 104.50M | **6.40M** | 890.0K | 93.9% |
 | `default` | 535 | 43.00M | **3.40M** | 420.0K | 92.1% |
 
+### Phase Breakdown: Exploration vs Implementation KPI
+
+| Agent | Active Sessions (with edits) | Exploration (before 1st edit) | Implementation & Verification | Pure Research Sessions | % Before 1st Edit (of all) | % Before 1st Edit (in edit sessions) | Avg Uncached / Edit Session |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **Codex** | 84 (**31**) | **3.53M** (690 steps) | 9.09M (1790 steps) | 3.88M (640 steps) | **21.4%** | **28.0%** | **407.1K** |
+| **Antigravity (`agy`)** | 41 (**10**) | **2.93M** (340 steps) | 5.97M (685 steps) | 1.60M (260 steps) | **27.9%** | **32.9%** | **889.7K** |
+
 ## 2. Cross-Session Repeated Lookups (Automation Candidates)
 
 ### `.env` & Credential Files Touched Across Sessions
@@ -119,6 +126,16 @@ agent-audit --days 7 --output /tmp/agent-audit-latest.md
 | `codegraph.find_symbol` | 184 | 6 | 3.3% | `status=error / empty confident_results` (6) |
 | `codegraph.callers_of` | 92 | 19 | 20.7% | `input validation error (wrong arg name)` (14) |
 
+### Codegraph Adoption in Antigravity (`agy`)
+- **Codegraph calls:** **48 total calls** across **14 sessions** (34.1% of active agy sessions).
+- **Comparison vs manual navigation:** `read_file`/`view_file` — **345 calls**, `grep_search` + shell `rg`/`grep` — **52 calls** (across 19 sessions).
+
+| Codegraph Tool | Calls | Sessions | Share of Calls |
+|---|---:|---:|---:|
+| `mcp_codegraph_find_symbol` | 29 | 12 | 60.4% |
+| `mcp_codegraph_semantic_search` | 11 | 6 | 22.9% |
+| `mcp_codegraph_callers_of` | 8 | 5 | 16.7% |
+
 ### Top Failing Shell Commands (Codex)
 - **14 failures** (out of 38 calls across 12 sessions): `pytest tests/api/test_webhooks.py -q`
 - **7 failures** (out of 19 calls across 6 sessions): `gh pr checks <PR>`
@@ -128,6 +145,8 @@ agent-audit --days 7 --output /tmp/agent-audit-latest.md
 - **3 sessions with loop:** `docker compose ps`
 
 ## 4. Context Bloat X-Ray (4-Lens Breakdown)
+
+> [!NOTE] Metrics in Sections 2–4 (file reads, subagents, cache busts) are overlapping slices of total token spend (e.g., a subagent also reads files and can trigger a cache bust) and should not be summed mechanically.
 
 - **Codex:** command outputs >30 KB — **12**, context compactions (`contextCompaction`) — **8** (across 5 sessions).
   Commands most frequently dumping >30 KB into Codex context:

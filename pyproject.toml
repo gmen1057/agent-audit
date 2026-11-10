@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-audit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Zero-dependency CLI & Agent Skill for auditing Codex and Antigravity (agy) coding agent sessions: token usage, prompt cache efficiency, context bloat X-ray, and tool failures."
 readme = "README.md"
 requires-python = ">=3.10"

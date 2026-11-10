@@ -85,7 +85,12 @@ class AgentAuditTests(unittest.TestCase):
                         "usage": {"input_tokens": 20000, "cached_input_tokens": 15000, "output_tokens": 500, "reasoning_output_tokens": 200},
                     },
                 },
-                # Jump from 20K -> 65K (+45K spike)
+                # Jump from 20K -> 65K (+45K spike) + edit tool call starting implementation phase
+                {
+                    "type": "response_item",
+                    "timestamp": ts_iso,
+                    "payload": {"type": "function_call", "name": "apply_patch", "arguments": "*** Begin Patch"},
+                },
                 {
                     "type": "token_usage_record",
                     "timestamp": ts_iso,
@@ -123,8 +128,20 @@ class AgentAuditTests(unittest.TestCase):
                     "cache_read_tokens": 16000,
                     "output_tokens": 300,
                     "tool_calls": [
+                        {"name": "mcp_codegraph_find_symbol", "arguments": {"project": "acme-app", "name": "handle_webhook"}},
                         {"name": "read_file", "arguments": {"Path": "/workspace/acme-app/main.py", "StartLine": 1, "EndLine": 50}},
                         {"name": "read_file", "arguments": {"Path": "/workspace/acme-app/monolith.py"}},
+                    ],
+                },
+                {
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": 2,
+                    "created_at": ts_iso,
+                    "input_tokens": 6000,
+                    "cache_read_tokens": 18000,
+                    "output_tokens": 250,
+                    "tool_calls": [
+                        {"name": "edit_file", "arguments": {"Path": "/workspace/acme-app/main.py", "Target": "a", "Replacement": "b"}},
                     ],
                 },
             ]
@@ -140,18 +157,39 @@ class AgentAuditTests(unittest.TestCase):
             self.assertEqual(codex_data["token_totals"]["cached_input_tokens"], 85000)
             self.assertEqual(len(codex_data["token_spikes"]), 1)
             self.assertEqual(len(codex_data["cache_busts"]), 1)
+            self.assertEqual(codex_data["edit_sessions_count"], 1)
+            # Step 1 (5K uncached) is before 1st edit ('a'); Steps 2+3 (5K + 60K = 65K uncached) are 'b'
+            self.assertEqual(codex_data["phase_tokens"]["a"], 5000)
+            self.assertEqual(codex_data["phase_tokens"]["b"], 65000)
+            self.assertEqual(codex_data["phase_steps"]["a"], 1)
+            self.assertEqual(codex_data["phase_steps"]["b"], 2)
 
-            # Verify Antigravity accounting (input_tokens=4K uncached + 16K cached = 20K total)
-            self.assertEqual(agy_data["token_totals"]["steps"], 1)
-            self.assertEqual(agy_data["token_totals"]["input_tokens"], 20000)
-            self.assertEqual(agy_data["token_totals"]["cached_input_tokens"], 16000)
+            # Verify Antigravity accounting (step 1: 4K+16K=20K; step 2: 6K+18K=24K -> total 44K, cached 34K)
+            self.assertEqual(agy_data["token_totals"]["steps"], 2)
+            self.assertEqual(agy_data["token_totals"]["input_tokens"], 44000)
+            self.assertEqual(agy_data["token_totals"]["cached_input_tokens"], 34000)
             self.assertEqual(agy_data["read_bounded_counts"]["bounded"], 1)
             self.assertEqual(agy_data["read_bounded_counts"]["full"], 1)
+            self.assertEqual(agy_data["edit_sessions_count"], 1)
+            self.assertEqual(agy_data["phase_tokens"]["a"], 4000)
+            self.assertEqual(agy_data["phase_tokens"]["b"], 6000)
+            self.assertEqual(agy_data["codegraph_counts"]["mcp_codegraph_find_symbol"], 1)
 
             md_en = agent_audit.render_markdown(1, start_dt, codex_data, agy_data, lang="en")
             md_ru = agent_audit.render_markdown(1, start_dt, codex_data, agy_data, lang="ru")
             self.assertIn("Coding Agent Session Audit", md_en)
+            self.assertIn("Phase Breakdown: Exploration vs Implementation KPI", md_en)
+            self.assertIn("Codegraph Adoption in Antigravity", md_en)
+            self.assertIn("overlapping slices of total token spend", md_en)
             self.assertIn("Аудит сессий агентов", md_ru)
+            self.assertIn("Фазовый разрез: разведка vs реализация (Exploration vs Implementation KPI)", md_ru)
+            self.assertIn("Использование codegraph в Antigravity", md_ru)
+            self.assertIn("пересекающиеся срезы общего расхода", md_ru)
+
+            summary = agent_audit.build_json_summary(1, start_dt, codex_data, agy_data)
+            self.assertEqual(summary["codex"]["edit_sessions"], 1)
+            self.assertEqual(summary["codex"]["phase_uncached_tokens"]["exploration_before_first_edit"], 5000)
+            self.assertEqual(summary["antigravity"]["codegraph_calls"], 1)
 
 
 if __name__ == "__main__":
